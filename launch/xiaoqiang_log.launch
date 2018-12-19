@@ -1,0 +1,10 @@
+<launch>
+    <node name="xiaoqiang_logger_node" pkg="xiaoqiang_log" type="xiaoqiang_log_node.py">
+        <!-- 数据库名称 -->
+        <param name="database_name" value="xiaoqiang_log" />
+        <!-- 远程服务器 -->
+        <param name="server_url" value="http://127.0.0.1:9999" />
+        <!-- sharplink log 文件路径，用于确定机器id -->
+        <param name="sharplink_log" value="/home/xiaoqiang/Documents/ros/devel/lib/sharplink/server.log" />
+    </node>
+</launch>

@@ -1,0 +1,5 @@
+<launch>
+    <include file="$(find xiaoqiang_log)/launch/xiaoqiang_log.launch" />
+    <node name="xiaoqiang_logger_client" pkg="xiaoqiang_log" type="xiaoqiang_log_client.py"/>
+    <node name="xiaoqiang_logger_remote" pkg="xiaoqiang_log" type="xiaoqiang_log_server.py" args="0.0.0.0:9999"/>
+</launch>

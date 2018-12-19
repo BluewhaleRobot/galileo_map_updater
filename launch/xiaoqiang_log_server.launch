@@ -1,0 +1,3 @@
+<launch>
+    <node name="xiaoqiang_logger_remote" pkg="xiaoqiang_log" type="xiaoqiang_log_server.py" args="127.0.0.1:10425" output="screen"/>
+</launch>

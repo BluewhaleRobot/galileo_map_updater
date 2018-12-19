@@ -1,0 +1,20 @@
+<package format="2">
+  <name>galileo_map_updater</name>
+  <version>0.0.1</version>
+  <description>
+     Galileo map updater, check the quality of current map, update map automaticly if map is bad.
+  </description>
+  <license>MIT</license>
+  <author email="randoms@bwbot.org">Randoms</author>
+  <maintainer email="randoms@bwbot.org">Randoms</maintainer>
+  <url type="website">http://github.com/bluewhalerobot/galileo_map_updater</url>
+  <url type="bugtracker">https://github.com/bluewhalerobot/galileo_map_updater/issues</url>
+  <url type="repository">https://github.com/bluewhalerobot/galileo_map_updater</url>
+  
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <build_depend>dynamic_reconfigure</build_depend>
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+</package>
