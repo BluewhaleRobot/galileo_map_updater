@@ -29,12 +29,17 @@ import rospy
 import dynamic_reconfigure.server
 from galileo_map_updater.cfg import MapUpdaterConfig
 from map_updater import MapUpdater
+import time
 
 
 if __name__ == "__main__":
     rospy.init_node("galileo_map_updater")
     updater = MapUpdater()
     server = dynamic_reconfigure.server.Server(MapUpdaterConfig, updater.update_params)
-    rospy.spin()
+    rate = rospy.Rate(1)
+    while not rospy.is_shutdown():
+        rate.sleep()
+        updater.cal_score()
+    
 
     
