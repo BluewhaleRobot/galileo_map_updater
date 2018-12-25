@@ -28,8 +28,10 @@
 import math
 
 import rospy
+from move_base_msgs.msg import MoveBaseActionGoal
 from galileo_serial_server.msg import GalileoStatus
 from geometry_msgs.msg import PoseStamped, Quaternion, Point
+from nav_msgs.msg import Path
 from scipy import optimize
 from scipy.spatial.distance import cdist
 from std_msgs.msg import Bool
@@ -37,29 +39,54 @@ import tf
 from tf.transformations import (euler_from_quaternion, quaternion_conjugate,
                                 quaternion_from_euler)
 from visualization_msgs.msg import Marker
+from nav_msgs.srv import GetPlan, GetPlanRequest, GetMapResponse
 
 
 class MapUpdater():
     def __init__(self):
         self.config = None
-        self.tracking_status_sub = rospy.Subscriber(
-            "/ORB_SLAM/trackingFlag", Bool, self.update_tracking_status)
-        self.galileo_status_sub = rospy.Subscriber(
-            "/galileo/status", GalileoStatus, self.update_galileo_status)
         self.listener = tf.TransformListener(True, rospy.Duration(10.0))
         self.min_state_distance = 0.1
         self.max_track_distance = 2
         self.max_track_angle = 3.14
+        self.galileo_status = None
         self.scores = []
         self.path_points = []
         self.tracking_pose_records = []
+        self.tracking_pose_records_2d = []
+        self.check_update_flag = False
+        self.current_goal = None
+        self.current_plan = None
+
+        # 通过全局规划器，计算目标点的朝向
+        rospy.loginfo("waiting for move_base/make_plan service")
+        rospy.wait_for_service("/move_base/make_plan")
+        rospy.loginfo("waiting for move_base/make_plan service succeed")
+        self.make_plan = rospy.ServiceProxy('/move_base/make_plan', GetPlan)
+
         self.init_markers()
-        self.load_path()
-        self.cal_score()
+
+        # init subs
+        self.galileo_status_sub = rospy.Subscriber(
+            "/galileo/status", GalileoStatus, self.update_galileo_status
+        )
+        self.goal_sub = rospy.Subscriber(
+            "/move_base/goal", MoveBaseActionGoal, self.update_goal
+        )
+        self.plan_sub = rospy.Subscriber(
+            "/move_base/NLlinepatrolPlanner/plan", Path, self.update_plan
+        )
 
     def shutdown(self):
-        self.tracking_status_sub.unregister()
         self.galileo_status_sub.unregister()
+        self.goal_sub.unregister()
+        self.plan_sub.unregister()
+
+    def update_goal(self, goal):
+        self.current_goal = goal
+
+    def update_plan(self, plan):
+        self.current_plan = plan
 
     def update_params(self, config, level):
         self.min_state_distance = config["min_state_distance"]
@@ -67,12 +94,80 @@ class MapUpdater():
         self.max_track_angle = config["max_track_angle"]
         return config
 
-    def update_tracking_status(self, status):
-        pass
-
     def distance(self, point1, point2):
         return math.sqrt((point1[0] - point2[0]) * (point1[0] - point2[0])
                          + (point1[1] - point2[1]) * (point1[1] - point2[1]))
+
+    def check_update(self, goal=None):
+        if self.galileo_status is None:
+            return False
+        # 只有处在导航状态下才进行更新
+        if self.galileo_status.navStatus != 1 or self.galileo_status.targetNumID == -1:
+            return False
+        # 获取当前目标点
+        if self.current_plan is None:
+            return False
+        if goal is None:
+            if self.current_goal == None:
+                return False
+            goal = self.current_goal.goal.target_pose
+        # 获取当前导航路径
+        # 获取当前位置
+        current_pose = PoseStamped()
+        current_pose.header.frame_id = "map"
+        current_pose.pose.position.x = self.galileo_status.currentPosX
+        current_pose.pose.position.y = self.galileo_status.currentPosY
+        current_pose.pose.position.z = 0
+        q_angle = quaternion_from_euler(
+            0, 0, self.galileo_status.currentAngle, axes='sxyz')
+        current_pose.pose.orientation = Quaternion(*q_angle)
+        # 缩减当前路径至关键路径点
+        path_key_points = []
+        for point in self.current_plan.poses:
+            # 检查距离，跳过距离近的点
+            if len(path_key_points) >= 1:
+                last_point = path_key_points[-1]['pose'].pose
+                distance = self.distance([last_point.position.x,  last_point.position.y],
+                                         [point.pose.position.x,
+                                             point.pose.position.y]
+                                         )
+                if distance < self.min_state_distance:
+                    continue
+
+            current_pose_q = [point.pose.orientation.x, point.pose.orientation.y,
+                              point.pose.orientation.z, point.pose.orientation.w]
+            yaw = euler_from_quaternion(current_pose_q)[2]
+            path_key_points.append({
+                'pose': point,
+                'yaw': yaw
+            })
+        self.good_markers.points = [record['pose'].pose.position for record in filter(
+            lambda record: record["is_tracking"], self.tracking_pose_records)]
+        self.marker_pub.publish(self.good_markers)
+
+        # 计算当前路径关键点的坏点
+        bad_points = []
+        for key_point in path_key_points:
+            near_records = filter(lambda point: self.distance([key_point['pose'].pose.position.x, key_point['pose'].pose.position.y], [
+                                  point['pose'].pose.position.x, point['pose'].pose.position.y]) < self.max_track_distance, self.tracking_pose_records)
+            same_direction_points = filter(lambda point: abs(
+                key_point['yaw'] - point['yaw']) < self.max_track_angle, near_records)
+            if len(same_direction_points) == 0:
+                # 还没有追踪情况的记录
+                continue
+            track_points = filter(
+                lambda point: point['is_tracking'], same_direction_points)
+            if len(track_points) == 0:
+                bad_points.append(key_point)
+        # 根据需要判断是否要开启更新地图
+        if len(bad_points) > 0:
+            self.bad_markers.points = [
+                point['pose'].pose.position for point in bad_points]
+            self.marker_pub.publish(self.bad_markers)
+            rospy.logwarn("################")
+            rospy.logwarn(len(bad_points))
+            return True
+        return False
 
     def load_path(self, path="/home/xiaoqiang/slamdb/path.csv"):
         with open(path, "r") as nav_data_file:
@@ -107,7 +202,6 @@ class MapUpdater():
             pose_in_world.pose.orientation = Quaternion(*q_angle)
 
             # 转至map坐标系
-            rospy.loginfo("获取ORB_SLAM/World->TF map")
             tf_flag = False
             while not tf_flag and not rospy.is_shutdown():
                 try:
@@ -120,7 +214,6 @@ class MapUpdater():
                     tf_flag = False
                     rospy.logwarn("获取TF失败 ORB_SLAM/World->map")
                     rospy.logwarn(e)
-            rospy.loginfo("获取TF 成功 ORB_SLAM/World->map")
             pose_in_map = self.listener.transformPose(
                 "map", pose_in_world)
             point_font = PoseStamped()
@@ -128,7 +221,7 @@ class MapUpdater():
             point_font.pose.position = pose_in_map.pose.position
             point_font.pose.orientation = pose_in_map.pose.orientation
             yaw = euler_from_quaternion([pose_in_map.pose.orientation.x, pose_in_map.pose.orientation.y,
-                                   pose_in_map.pose.orientation.z, pose_in_map.pose.orientation.w])[2]
+                                         pose_in_map.pose.orientation.z, pose_in_map.pose.orientation.w])[2]
 
             point_back = PoseStamped()
             point_back.header.frame_id = "map"
@@ -164,10 +257,12 @@ class MapUpdater():
                           score['font']['pose'].pose.position.y]
             near_records = filter(lambda point: self.distance(score_posi, [
                                   point['pose'].pose.position.x, point['pose'].pose.position.y]) < self.max_track_distance, self.tracking_pose_records)
+
             font_near_records = filter(lambda point: abs(
-                score['font']['yaw'] - point['yaw']) < self.max_track_angle, near_records)
+                score['font']['yaw'] - point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
             back_near_records = filter(lambda point: abs(
-                score['back']['yaw'] - point['yaw']) < self.max_track_angle, near_records)
+                score['back']['yaw'] - point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
+
             if len(font_near_records) >= 1:
                 score['font']['is_track'] = True
             else:
@@ -177,8 +272,17 @@ class MapUpdater():
             else:
                 score['back']['is_track'] = False
         # 发布计算结果
+        bad_points = filter(
+            lambda score: not score['back']['is_track'], self.scores)
         self.bad_markers.points = [
-            score['font']['pose'].pose.position for score in self.scores]
+            score['font']['pose'].pose.position for score in bad_points]
+        self.marker_pub.publish(self.bad_markers)
+        good_points = filter(
+            lambda score: score['back']['is_track'], self.scores)
+        self.good_markers.points = [
+            score['font']['pose'].pose.position for score in good_points]
+
+        self.marker_pub.publish(self.good_markers)
         self.marker_pub.publish(self.bad_markers)
 
     def init_markers(self):
@@ -218,17 +322,61 @@ class MapUpdater():
         self.bad_markers.header.stamp = rospy.Time.now()
         self.bad_markers.points = []
 
+        self.back_good_markers = Marker()
+        self.back_good_markers.ns = "waypoints"
+        self.back_good_markers.id = 0
+        self.back_good_markers.type = Marker.CUBE_LIST
+        self.back_good_markers.action = Marker.ADD
+        self.back_good_markers.lifetime = rospy.Duration(0)
+        self.back_good_markers.scale.x = 0.05
+        self.back_good_markers.scale.y = 0.05
+        self.back_good_markers.color.r = 0
+        self.back_good_markers.color.g = 1
+        self.back_good_markers.color.b = 0
+        self.back_good_markers.color.a = 1
+        self.back_good_markers.header.frame_id = 'map'
+        self.back_good_markers.header.stamp = rospy.Time.now()
+        self.back_good_markers.points = []
+
+        self.back_bad_markers = Marker()
+        self.back_bad_markers.ns = "waypoints"
+        self.back_bad_markers.id = 1
+        self.back_bad_markers.type = Marker.CUBE_LIST
+        self.back_bad_markers.action = Marker.ADD
+        self.back_bad_markers.lifetime = rospy.Duration(0.8)
+        self.back_bad_markers.scale.x = 0.05
+        self.back_bad_markers.scale.y = 0.05
+        self.back_bad_markers.color.r = 1
+        self.back_bad_markers.color.g = 0
+        self.back_bad_markers.color.b = 0
+        self.back_bad_markers.color.a = 1
+        self.back_bad_markers.header.frame_id = 'map'
+        self.back_bad_markers.header.stamp = rospy.Time.now()
+        self.back_bad_markers.points = []
+
     def update_galileo_status(self, galileo_status):
-        if galileo_status.navStatus == 1 and galileo_status.mapStatus == 0 and len(self.scores) == 0:
-            # 在导航状态但未载入路径点
-            self.load_path()
+        self.galileo_status = galileo_status
         if len(self.tracking_pose_records) >= 1:
-            previous_posi = [self.tracking_pose_records[-1]['pose'].pose.position.x,
-                             self.tracking_pose_records[-1]['pose'].pose.position.y]
+            # 找到据现在点最近的点
+            closest_index = self.closest_node_index(
+                [galileo_status.currentPosX, galileo_status.currentPosY], self.tracking_pose_records_2d)
+            closest_record = self.tracking_pose_records[closest_index]
+            previous_posi = [closest_record['pose'].pose.position.x,
+                             closest_record['pose'].pose.position.y]
 
             # 距离太近，且角度差别不大
-            if self.pose_distance(previous_posi, [galileo_status.currentPosX, galileo_status.currentPosY]) < self.min_state_distance and \
-                    abs(galileo_status.currentAngle - self.tracking_pose_records[-1]['yaw']) < self.max_track_angle:
+            if self.distance(previous_posi, [galileo_status.currentPosX, galileo_status.currentPosY]) < self.min_state_distance and \
+                    abs(galileo_status.currentAngle - closest_record['yaw']) < self.max_track_angle:
+                # 如果状态相同
+                if closest_record['is_tracking'] == True and galileo_status.visualStatus == 1:
+                    return
+                if closest_record['is_tracking'] == False and galileo_status.visualStatus == 2:
+                    return
+                # 状态不同则更新点的状态
+                if galileo_status.visualStatus == 1:
+                    closest_record['is_tracking'] = True
+                if galileo_status.visualStatus == 2:
+                    closest_record['is_tracking'] = False
                 return
 
         currentPose = PoseStamped()
@@ -247,6 +395,9 @@ class MapUpdater():
             'is_tracking': tracking_flag,
             'yaw': galileo_status.currentAngle,
         })
+        self.tracking_pose_records_2d.append([
+            galileo_status.currentPosX, galileo_status.currentPosY
+        ])
 
     def get_target_direction(self, target_point, nav_path_points):
         target_point_2d = target_point
@@ -266,8 +417,8 @@ class MapUpdater():
 
         def f_1(x, A, B):
             return A*x + B
-        A1, B = optimize.curve_fit(f_1, [nearest_point[0], nearest_point_2[0], nearest_point_3[0]],
-                                 [nearest_point[1], nearest_point_2[1], nearest_point_3[1]])[0]
+        A1, _ = optimize.curve_fit(f_1, [nearest_point[0], nearest_point_2[0], nearest_point_3[0]],
+                                   [nearest_point[1], nearest_point_2[1], nearest_point_3[1]])[0]
         if nearest_point_3[0] >= nearest_point[0]:
             return (1 / A1, 1)
         else:
@@ -277,3 +428,6 @@ class MapUpdater():
         filtered_nodes = filter(
             lambda point: point[0] != node[0] or point[1] != node[1], nodes)
         return filtered_nodes[cdist([node], filtered_nodes).argmin()]
+
+    def closest_node_index(self, node, nodes):
+        return cdist([node], nodes).argmin()

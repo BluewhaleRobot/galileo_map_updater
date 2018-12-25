@@ -1,0 +1,8 @@
+<launch>
+  <node pkg="galileo_map_updater" type="map_updater_node.py" name="galileo_map_updater" output="screen"/>
+  <node name="map_updater_params_configure" pkg="dynamic_reconfigure" type="dynparam" args="set_from_parameters galileo_map_updater">
+    <param name="min_state_distance" type="double" value="0.2" />
+    <param name="max_track_distance" type="double" value="0.5" />
+    <param name="max_track_angle" type="double" value="0.785" />
+  </node>
+</launch>

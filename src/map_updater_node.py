@@ -39,7 +39,7 @@ if __name__ == "__main__":
     rate = rospy.Rate(1)
     while not rospy.is_shutdown():
         rate.sleep()
-        updater.cal_score()
+        updater.check_update()
     
 
     
