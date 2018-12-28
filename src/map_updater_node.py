@@ -27,6 +27,7 @@
 
 import rospy
 import dynamic_reconfigure.server
+import dynamic_reconfigure.client
 from galileo_map_updater.cfg import MapUpdaterConfig
 from map_updater import MapUpdater
 import time
@@ -36,10 +37,23 @@ if __name__ == "__main__":
     rospy.init_node("galileo_map_updater")
     updater = MapUpdater()
     server = dynamic_reconfigure.server.Server(MapUpdaterConfig, updater.update_params)
+    client = dynamic_reconfigure.client.Client("bwMono")
     rate = rospy.Rate(1)
     while not rospy.is_shutdown():
         rate.sleep()
-        updater.check_update()
+        if updater.check_update():
+            client.update_configuration({
+                'update_map': True,
+                'enable_gba': False,
+            })
+        else:
+            client.update_configuration({
+                'update_map': False,
+                'enable_gba': False,
+            })
+        if updater.is_need_save():
+            pass
+
     
 
     

@@ -107,6 +107,15 @@ class MapUpdater():
         # 获取当前目标点
         if self.current_plan is None:
             return False
+
+        # 如果当前在比较剧烈的转动中，则开启更新
+        if self.galileo_status.currentSpeedTheta != 0:
+            rospy.loginfo("angle : " + str(abs(self.galileo_status.currentSpeedX / self.galileo_status.currentSpeedTheta)))
+
+        if self.galileo_status.currentSpeedTheta != 0 and \
+                abs(self.galileo_status.currentSpeedX / self.galileo_status.currentSpeedTheta) < 0.2:
+            return False
+
         if goal is None:
             if self.current_goal == None:
                 return False
@@ -121,9 +130,18 @@ class MapUpdater():
         q_angle = quaternion_from_euler(
             0, 0, self.galileo_status.currentAngle, axes='sxyz')
         current_pose.pose.orientation = Quaternion(*q_angle)
+
+        # 截断路径，从当前位置至之后10米范围
+        current_index = self.closest_node_index([self.galileo_status.currentPosX, self.galileo_status.currentPosY],
+            [[pose.pose.position.x, pose.pose.position.y] for pose in self.current_plan.poses]
+        )
+        self.current_plan.poses = self.current_plan.poses[current_index:]
+        # 当前位置之后10米范围内
+        current_path = self.current_plan.poses[:100]
+
         # 缩减当前路径至关键路径点
         path_key_points = []
-        for point in self.current_plan.poses:
+        for point in current_path:
             # 检查距离，跳过距离近的点
             if len(path_key_points) >= 1:
                 last_point = path_key_points[-1]['pose'].pose
@@ -150,8 +168,8 @@ class MapUpdater():
         for key_point in path_key_points:
             near_records = filter(lambda point: self.distance([key_point['pose'].pose.position.x, key_point['pose'].pose.position.y], [
                                   point['pose'].pose.position.x, point['pose'].pose.position.y]) < self.max_track_distance, self.tracking_pose_records)
-            same_direction_points = filter(lambda point: abs(
-                key_point['yaw'] - point['yaw']) < self.max_track_angle, near_records)
+            same_direction_points = filter(lambda point: self.get_angle(
+                key_point['yaw'], point['yaw']) < self.max_track_angle, near_records)
             if len(same_direction_points) == 0:
                 # 还没有追踪情况的记录
                 continue
@@ -168,6 +186,11 @@ class MapUpdater():
             rospy.logwarn(len(bad_points))
             return True
         return False
+
+    def is_need_save(self):
+        # 检查当前是否修要保存更新的地图
+        pass
+        
 
     def load_path(self, path="/home/xiaoqiang/slamdb/path.csv"):
         with open(path, "r") as nav_data_file:
@@ -258,10 +281,10 @@ class MapUpdater():
             near_records = filter(lambda point: self.distance(score_posi, [
                                   point['pose'].pose.position.x, point['pose'].pose.position.y]) < self.max_track_distance, self.tracking_pose_records)
 
-            font_near_records = filter(lambda point: abs(
-                score['font']['yaw'] - point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
-            back_near_records = filter(lambda point: abs(
-                score['back']['yaw'] - point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
+            font_near_records = filter(lambda point: self.get_angle(
+                score['font']['yaw'], point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
+            back_near_records = filter(lambda point: self.get_angle(
+                score['back']['yaw'], point['yaw']) < self.max_track_angle and point['is_tracking'], near_records)
 
             if len(font_near_records) >= 1:
                 score['font']['is_track'] = True
@@ -357,26 +380,16 @@ class MapUpdater():
     def update_galileo_status(self, galileo_status):
         self.galileo_status = galileo_status
         if len(self.tracking_pose_records) >= 1:
-            # 找到据现在点最近的点
-            closest_index = self.closest_node_index(
-                [galileo_status.currentPosX, galileo_status.currentPosY], self.tracking_pose_records_2d)
-            closest_record = self.tracking_pose_records[closest_index]
-            previous_posi = [closest_record['pose'].pose.position.x,
-                             closest_record['pose'].pose.position.y]
-
-            # 距离太近，且角度差别不大
-            if self.distance(previous_posi, [galileo_status.currentPosX, galileo_status.currentPosY]) < self.min_state_distance and \
-                    abs(galileo_status.currentAngle - closest_record['yaw']) < self.max_track_angle:
-                # 如果状态相同
-                if closest_record['is_tracking'] == True and galileo_status.visualStatus == 1:
-                    return
-                if closest_record['is_tracking'] == False and galileo_status.visualStatus == 2:
-                    return
-                # 状态不同则更新点的状态
-                if galileo_status.visualStatus == 1:
-                    closest_record['is_tracking'] = True
-                if galileo_status.visualStatus == 2:
-                    closest_record['is_tracking'] = False
+            near_points = filter(lambda record: self.distance([record['pose'].pose.position.x, record['pose'].pose.position.y],
+                                                              [galileo_status.currentPosX, galileo_status.currentPosY]) < self.min_state_distance, self.tracking_pose_records)
+            same_direction_points = filter(lambda record: self.get_angle(
+                record['yaw'], galileo_status.currentAngle) < self.max_track_angle, near_points)
+            if len(same_direction_points) != 0:
+                for record in same_direction_points:
+                    if galileo_status.visualStatus == 1:
+                        record["is_tracking"] = True
+                    else:
+                        record["is_tracking"] = False
                 return
 
         currentPose = PoseStamped()
@@ -419,7 +432,7 @@ class MapUpdater():
             return A*x + B
         A1, _ = optimize.curve_fit(f_1, [nearest_point[0], nearest_point_2[0], nearest_point_3[0]],
                                    [nearest_point[1], nearest_point_2[1], nearest_point_3[1]])[0]
-        if nearest_point_3[0] >= nearest_point[0]:
+        if (nearest_point_3[0] - nearest_point[0]) * A1 >= 0:
             return (1 / A1, 1)
         else:
             return (-1 / A1, -1)
@@ -431,3 +444,8 @@ class MapUpdater():
 
     def closest_node_index(self, node, nodes):
         return cdist([node], nodes).argmin()
+
+    def get_angle(self, yaw1, yaw2):
+        if abs(yaw1 - yaw2) > math.pi:
+            return abs(yaw1 - yaw2) - math.pi
+        return abs(yaw1 - yaw2)
